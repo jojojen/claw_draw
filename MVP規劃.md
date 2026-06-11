@@ -207,9 +207,6 @@ practice_sessions
 - submitted_at
 - canvas_width
 - canvas_height
-- analyzer_version
-- rubric_version
-- result_summary_json
 
 exercise_targets
 - id
@@ -224,28 +221,38 @@ strokes
 - target_id
 - stroke_index
 - target_assignment_method
+- target_assignment_status
 - target_assignment_confidence
 - tool
 - color
 - width
 - points_json
-- raw_event_summary_json
 - started_at
 - ended_at
+
+analysis_runs
+- id
+- session_id
+- analyzer_version
+- rubric_version
+- created_at
+- result_summary_json
 ```
 
 `points_json` 第一版直接保存每一筆 stroke 的點資料，例如：
 
 ```json
 [
-  {"x": 123.4, "y": 56.7, "pressure": 0.42, "timestamp_ms": 180},
-  {"x": 126.1, "y": 57.2, "pressure": 0.44, "timestamp_ms": 196}
+  {"x": 123.4, "y": 56.7, "pressure": 0.42, "tilt_x": 14.0, "tilt_y": -3.0, "timestamp_ms": 0},
+  {"x": 126.1, "y": 57.2, "pressure": 0.44, "tilt_x": 14.0, "tilt_y": -2.0, "timestamp_ms": 16}
 ]
 ```
 
+`timestamp_ms` 定義為相對該 stroke 開始的毫秒數。若要保留瀏覽器原始事件時間，可在 stroke 層另存 `started_at` 與原始 event metadata，但分析邏輯以相對時間為主。
+
 暫時不把每個 point 拆成 SQLite row。MVP 查詢主要以 session / stroke 為單位，JSON blob 較簡單。若未來需要大量跨 session 統計，再另建 derived metrics table。
 
-`result_summary_json` 第一版可保存：
+`analysis_runs.result_summary_json` 第一版可保存：
 
 - completion_count
 - expected_count
@@ -257,7 +264,7 @@ strokes
 - redraw_score
 - feedback_text
 
-`analyzer_version` 與 `rubric_version` 必須保存，因為之後會用歷史 session 重跑分析、調整 threshold。沒有版本欄位，舊結果與新公式會混在一起。
+`analysis_runs` 的目的，是讓同一份原始 session 可以被不同 `analyzer_version` 與 `rubric_version` 重跑。`practice_sessions` 只保存原始事實，不保存分析結論。
 
 ## Stroke 與 Target 歸屬
 
@@ -268,17 +275,22 @@ strokes
 - 前端維護目前 active target。
 - 使用者每畫一筆 stroke，先歸屬到 active target。
 - 後端用幾何位置做 sanity check。
-- 若 stroke 起點或路徑明顯更接近其他 target，標記為 ambiguous。
-- ambiguous stroke 不參與 pass / retry 判定，只列入回饋提示。
+- 若 stroke 起點或路徑明顯更接近其他 target，標記為 `ambiguous`。
+- `ambiguous` 或 `unassigned` stroke 不參與 pass / retry 判定，只列入回饋提示。
 
 `target_assignment_method` 建議值：
 
 - `frontend_active_target`
 - `nearest_target`
 - `manual_override`
-- `ambiguous`
 
-`target_assignment_confidence` 使用 `0.0` 到 `1.0`，用於後續分析時排除低信心資料。
+`target_assignment_status` 建議值：
+
+- `assigned`
+- `ambiguous`
+- `unassigned`
+
+`target_assignment_confidence` 使用 `0.0` 到 `1.0`，用於後續分析時排除低信心資料；`target_assignment_status` 用於明確表示這筆資料是否可進正式分析。
 
 ## Rubric 原則
 
@@ -336,17 +348,19 @@ MVP 完成時應該能做到：
 2. Mac mini 可啟動本地 server。
 3. iPad Safari 可以開啟畫布頁。
 4. Apple Pencil stroke 能被完整記錄。
-5. 可以保存 pressure、timestamp、座標、stroke index 與 target_id。
+5. 可以保存 pressure、tilt、timestamp、座標、stroke index 與 target_id。
 6. 可以完成兩點直線、圓形、橢圓三種練習。
 7. Submit 後資料寫入 SQLite。
-8. 頁面顯示一段簡短、非 AI 的幾何分析回饋。
-9. 重新整理後仍能看到最近練習紀錄。
-10. 不需要外部付費 API。
+8. 可以對同一 session 產生至少一筆 `analysis_runs` 記錄。
+9. 有定時 SQLite `.backup` 機制，且能用備份檔完成一次 restore 驗證。
+10. 頁面顯示一段簡短、非 AI 的幾何分析回饋。
+11. 重新整理後仍能看到最近練習紀錄。
+12. 不需要外部付費 API。
 
 ## 建議實作順序
 
 1. 做 iPad Safari + Apple Pencil capture spike。
-2. 在實機確認 pointer events、pressure、timestamp、取樣率、touch-action、防捲動與誤觸處理。
+2. 在實機確認 pointer events、pressure、tilt、event.timeStamp、取樣率、touch-action、防捲動與誤觸處理。
 3. 將 spike stroke dump 成 JSON，保存幾份真實樣本。
 4. 根據真實 Pencil 資料決定 point schema、取樣策略與基礎 smoothing 策略。
 5. 建立 Rust workspace 與 `claw_draw_core`。
@@ -355,7 +369,9 @@ MVP 完成時應該能做到：
 8. 建立 TypeScript Canvas 頁，支援 active target 與 stroke capture。
 9. 建立 Rust axum server，提供靜態頁與 submit API。
 10. 加 SQLite schema 與 session 保存。
-11. 加圓形與橢圓分析。
-12. 加簡單 history 頁。
-13. 寫 launchd 安裝腳本。
-14. 再回頭規劃 `aka_no_claw` 的 `/draw web` 入口。
+11. 加 `analysis_runs` 與重跑分析入口。
+12. 寫 launchd 定時 SQLite `.backup` 腳本，並驗證 restore 流程。
+13. 加圓形與橢圓分析。
+14. 加簡單 history 頁。
+15. 寫 launchd 安裝腳本。
+16. 再回頭規劃 `aka_no_claw` 的 `/draw web` 入口。
